@@ -201,8 +201,6 @@ def main():
         f.write(sig_body)
 
     print("\n\033[92m✅ Extraction complete (raw-safe, no reformatting).\033[0m\n")
-    print(f"• Data:      {outdir}/message.txt")
-    print(f"• Signature: {outdir}/signature.asc")
 
 if __name__ == "__main__":
     main()

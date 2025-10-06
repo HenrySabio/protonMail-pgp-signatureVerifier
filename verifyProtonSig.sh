@@ -23,10 +23,17 @@ python3 prepareVerification.py "$EML"
 
 # 2) Verify with GPG (in a conditional so set -e won't kill the script)
 echo -e "\033[1;34m🔍 Running GPG verification...\033[0m\n"
-if gpg --verify "$OUTDIR/signature.asc" "$OUTDIR/message.txt"; then
-  echo -e "\n\033[1;32m🔺 Processing Complete -- See Details Above 🔺\033[0m\n"
-  exit_code=0
+
+echo -e "\033[1;34m------ GPG Verify - Begin ------\033[0m"
+echo -e "\033[1;34m|      ↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓↓      |\033[0m\n"
+if gpg -v --verify "$OUTDIR/signature.asc" "$OUTDIR/message.txt"; then
+echo -e "\n\033[1;34m|      ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑      |\033[0m"
+echo -e "\033[1;34m------  GPG Verify - End  ------\033[0m"
+echo -e "\n\033[1;32m🔺 Processing Complete -- See Details Above 🔺\033[0m\n"
+exit_code=0
 else
+echo -e "\n\033[1;34m|      ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑      |\033[0m"
+  echo -e "\033[1;34m------  GPG Verify - End  ------\033[0m"
   echo -e "\n\033[1;31m🔺 Verification Failed -- See Details Above 🔺\033[0m\n"
   exit_code=1
 fi
