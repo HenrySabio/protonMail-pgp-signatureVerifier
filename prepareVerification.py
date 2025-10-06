@@ -1,122 +1,208 @@
+#!/usr/bin/env python3
 import sys
-import email
-from email import policy
 import re
 
-def extract_boundary_from_header(content_type_header):
+def die(msg):
+    print(f"❌ {msg}")
+    sys.exit(1)
+
+def find_header_block(raw: bytes):
     """
-    Extracts the boundary value from a Content-Type header,
-    safely handling both quoted and unquoted formats.
+    Split raw message into (headers_bytes, rest_bytes) at the first blank line.
+    Detects either CRLF or LF as the separator.
     """
-    match = re.search(r'boundary=("[^"]+"|[^;\s]+)', content_type_header, re.IGNORECASE)
-    if match:
-        boundary = match.group(1)
-        if boundary.startswith('"') and boundary.endswith('"'):
-            boundary = boundary[1:-1]  # Remove quotes
-        return boundary
-    return None
+    sep = b"\r\n\r\n"
+    idx = raw.find(sep)
+    if idx != -1:
+        return raw[:idx], raw[idx+len(sep):], b"\r\n"
+    # fallback to LF
+    sep = b"\n\n"
+    idx = raw.find(sep)
+    if idx == -1:
+        die("Could not find end of top-level header block.")
+    return raw[:idx], raw[idx+len(sep):], b"\n"
 
-def fix_content_type_header(raw_str, boundary):
+def get_top_level_boundary(top_headers: bytes):
     """
-    Prepends the correctly formatted Content-Type header with no quotes or line wrapping.
+    Parse the *raw* top-level headers to get the multipart/signed boundary token.
+    We do not normalize quoting; we only need the token (without quotes)
+    to find boundary delimiter lines in the body.
     """
-    header = f'Content-Type: multipart/mixed;boundary={boundary}\n\n'
-    return header + raw_str
+    # join folded lines for Content-Type parsing (RFC allows folding)
+    # We do minimal unfolding: lines starting with space/tab are continuations.
+    lines = top_headers.splitlines()
+    unfolded = []
+    for line in lines:
+        if unfolded and (line.startswith(b" ") or line.startswith(b"\t")):
+            unfolded[-1] += line
+        else:
+            unfolded.append(line)
 
-def extract_signed_body_only(part, boundary):
+    # find Content-Type header (case-insensitive)
+    ct = None
+    for l in unfolded:
+        if l.lower().startswith(b"content-type:"):
+            ct = l[len(b"content-type:"):].strip()
+            break
+    if not ct:
+        die("Top-level Content-Type header not found.")
+
+    # must be multipart/signed
+    if b"multipart/signed" not in ct.lower():
+        die("Top-level message is not multipart/signed.")
+
+    # extract boundary parameter value (quoted or not)
+    m = re.search(br'boundary=(?P<q>")?(?P<val>[^";\s]+)(?P=q)?', ct, flags=re.IGNORECASE)
+    if not m:
+        die("Could not find boundary parameter on multipart/signed.")
+    boundary_token = m.group('val')  # bytes, no quotes
+    return boundary_token
+
+def iter_signed_boundaries(body: bytes, boundary: bytes):
     """
-    Extracts just the multipart/mixed section up to and including the closing boundary,
-    avoiding any extra parts like attachments or public keys.
+    Yield (start_index, end_index, is_closing) for each boundary delimiter line:
+      --boundary[OWS]CRLF        (part boundary)
+      --boundary--[OWS]CRLF      (closing boundary)
+    We search in multiline mode anchored to start-of-line.
     """
-    payload = part.get_payload()
+    # Allow optional whitespace after delimiter before EOL.
+    # Match either LF or CRLF line endings. Use (?m) for ^ and $ over multiple lines.
+    pattern = re.compile(
+        br'(?m)^(--' + re.escape(boundary) + br'(?P<closing>--)?)[ \t]*\r?\n'
+    )
+    for m in pattern.finditer(body):
+        start = m.start()
+        end   = m.end()
+        is_closing = (m.group('closing') is not None)
+        yield start, end, is_closing
 
-    if isinstance(payload, list):
-        raw_parts = []
-        # Use a policy that disables header folding/wrapping so long header
-        # lines (like Content-Type with many parameters) are not split.
-        no_wrap_policy = policy.default.clone(max_line_length=None)
-        for p in payload:
-            part_str = p.as_string(policy=no_wrap_policy)
-            raw_parts.append(f'--{boundary}\n{part_str}')
-        raw_parts.append(f'--{boundary}--\n')
-        return '\n'.join(raw_parts)
-    else:
-        print("❌ Unexpected payload structure in signed part.")
-        return None
+def split_multipart_signed_parts(body: bytes, boundary: bytes):
+    """
+    For a multipart/signed body:
+      preamble, then:
+        --boundary CRLF
+          <part1 headers + body>
+        --boundary CRLF
+          <part2 headers + body>
+        --boundary-- CRLF
+      epilogue
+    Return (part1_bytes, part2_bytes) each including their own headers+body,
+    but NOT including any boundary delimiter lines.
+    """
+    # Find all boundaries
+    bmarks = list(iter_signed_boundaries(body, boundary))
+    if len(bmarks) < 2:
+        die("Did not find enough boundary delimiters inside multipart/signed body.")
 
-def extract_pgp_parts(filename):
-    with open(filename, 'rb') as f:
-        msg = email.message_from_binary_file(f, policy=policy.default)
+    # We expect at least:
+    #   #0: first part delimiter
+    #   #1: second part delimiter
+    #   last: closing delimiter (with --)
+    # Extract the segments between:
+    #   part1 = [end of bmarks[0] : start of bmarks[1]]
+    #   part2 = [end of bmarks[1] : start of closing]
+    # Find closing index
+    closing_idx = None
+    for i, (_s, _e, is_closing) in enumerate(bmarks):
+        if is_closing:
+            closing_idx = i
+            break
+    if closing_idx is None:
+        die("Closing boundary not found (no -- after boundary).")
 
-    # Locate the multipart/signed part
-    signed_part = None
-    if msg.get_content_type() == 'multipart/signed':
-        signed_part = msg
-    else:
-        for part in msg.walk():
-            if part.get_content_type() == 'multipart/signed':
-                signed_part = part
-                break
+    if closing_idx < 2:
+        die("Not enough parts before the closing boundary (need 2 parts).")
 
-    if not signed_part:
-        print("❌ Could not find multipart/signed MIME part.")
-        return False
+    # Compute slices
+    first_delim_start, first_delim_end, _ = bmarks[0]
+    second_delim_start, second_delim_end, _ = bmarks[1]
+    closing_start, _closing_end, _ = bmarks[closing_idx]
 
-    # Extract signed data and signature parts
+    part1 = body[first_delim_end:second_delim_start]
+    part2 = body[second_delim_end:closing_start]
+
+    # Trim leading lone CRLF/LF if present (after boundary lines there is normally no blank line,
+    # but some generators might add one spuriously). We only trim a single empty line safely.
+    for p_name, p in (("part1", part1), ("part2", part2)):
+        if p.startswith(b"\r\n"):
+            p = p[2:]
+        elif p.startswith(b"\n"):
+            p = p[1:]
+        if p_name == "part1":
+            part1 = p
+        else:
+            part2 = p
+
+    return part1, part2
+
+def strip_headers(part_bytes: bytes):
+    """
+    Split a MIME part into (headers_bytes, body_bytes) using the first blank line.
+    Return (headers, body). If no blank line, body is empty.
+    Preserves the original line endings.
+    """
+    # Try CRLF first
+    sep = b"\r\n\r\n"
+    idx = part_bytes.find(sep)
+    if idx != -1:
+        return part_bytes[:idx], part_bytes[idx+len(sep):]
+    # Then LF
+    sep = b"\n\n"
+    idx = part_bytes.find(sep)
+    if idx == -1:
+        # no header/body split, assume no headers
+        return b"", part_bytes
+    return part_bytes[:idx], part_bytes[idx+len(sep):]
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python extract_pgp_signature_rawsafe.py <email_file.eml>")
+        sys.exit(1)
+
+    path = sys.argv[1]
     try:
-        signed_data = signed_part.get_payload(0)
-        signature_part = signed_part.get_payload(1)
-    except Exception:
-        print("❌ Could not extract signed and signature parts.")
-        return False
+        raw = open(path, "rb").read()
+    except Exception as e:
+        die(f"Failed to read file: {e}")
 
-    if not signature_part or signature_part.get_content_type() != 'application/pgp-signature':
-        print("❌ Could not find PGP signature part.")
-        return False
+    # 1) Split top-level headers and body; detect EOL style
+    top_headers, top_body, _eol = find_header_block(raw)
 
-    # Get boundary string from Content-Type header
-    content_type_header = signed_data.get('Content-Type', '')
-    boundary = extract_boundary_from_header(content_type_header)
-    if not boundary:
-        print("❌ Could not extract boundary from Content-Type header.")
-        return False
+    # 2) Extract top-level multipart/signed boundary token (no normalization)
+    boundary = get_top_level_boundary(top_headers)
 
-    # Extract only signed body up to closing boundary
-    raw_signed_body = extract_signed_body_only(signed_data, boundary)
-    if not raw_signed_body:
-        print("❌ Failed to extract clean multipart body.")
-        return False
+    # 3) Extract the two parts (between boundary delimiters) as raw bytes
+    part1, part2 = split_multipart_signed_parts(top_body, boundary)
 
-    # Prepend exact Content-Type line to match what was signed
-    final_message = fix_content_type_header(raw_signed_body, boundary)
+    # 4) part1 is the SIGNED ENTITY (headers+body) EXACTLY as sent — save as message.txt
+    # NOTE: No modifications, no reserialization, no added/removed quotes/spaces.
+    # 5) part2 is the signature container; strip its headers so only the ASCII armored block remains.
+    _sig_headers, sig_body = strip_headers(part2)
 
-    # Decode and extract the signature
-    signature = signature_part.get_payload(decode=True).decode('utf-8')
-
-    # Ensure output directory exists
+    # Ensure output
     import os
-    os.makedirs('extractedSignatureData', exist_ok=True)
+    outdir = "extractedSignatureData"
+    os.makedirs(outdir, exist_ok=True)
 
-    # Create if does not exist
-    if not os.path.exists('extractedSignatureData'):
-        os.makedirs('extractedSignatureData')
+    def trim_trailing_newline(b: bytes) -> bytes:
+        if b.endswith(b"\r\n"):
+            return b[:-2]
+        elif b.endswith(b"\n"):
+            return b[:-1]
+        return b
 
-    # Save files
-    with open('extractedSignatureData/message.txt', 'w', encoding='utf-8') as f:
-        f.write(final_message)
+    part1 = trim_trailing_newline(part1)
+    sig_body = trim_trailing_newline(sig_body)
 
-    with open('extractedSignatureData/signature.asc', 'w', encoding='utf-8') as f:
-        f.write(signature)
+    with open(f"{outdir}/message.txt", "wb") as f:
+        f.write(part1)
 
-    print("\n\033[92m✅ Extraction of signed message and signature complete.\033[0m\n")
-    return True
+    with open(f"{outdir}/signature.asc", "wb") as f:
+        f.write(sig_body)
+
+    print("\n\033[92m✅ Extraction complete (raw-safe, no reformatting).\033[0m\n")
+    print(f"• Data:      {outdir}/message.txt")
+    print(f"• Signature: {outdir}/signature.asc")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python extract_pgp_signature.py <email_file.eml>")
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-    success = extract_pgp_parts(input_file)
-    if not success:
-        sys.exit(1)
+    main()
