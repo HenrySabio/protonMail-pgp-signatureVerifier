@@ -9,6 +9,9 @@ This script enables you to verify the signature by:
 - Extracting the correct parts of the email (including hidden sections).
 - Running the `gpg --verify` command on the properly extracted data using the signature.
 
+### It's very likely this script will work on *any* openPGP/MIME signed email.
+> **Note:** This script does **not** apply to emails using inline PGP. Inline PGP messages can simply be copied and verified directly with GPG, without needing special extraction or handling.
+
 ## Usage
 
 1. **Download the signed email** from your email client (e.g., Gmail).  
